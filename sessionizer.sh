@@ -13,14 +13,20 @@ list_repos() {
     xargs -n1 dirname | sort -u
 }
 
+list_dirs() {
+  fd --type d --max-depth 2 . "$SEARCH_ROOT" 2>/dev/null |
+    sed 's:/*$::' | sort -u
+}
+
 session_names() { tmux list-sessions -F '#{session_name}' 2>/dev/null || true; }
 session_roots() { tmux list-sessions -F '#{@sessionizer_root}' 2>/dev/null | sed '/^$/d' || true; }
 
 picker_input() {
+  local mode="${1:-repos}"
   session_names | sed 's/^/● /'
   local roots dir
   roots="$(session_roots)"
-  list_repos | while IFS= read -r dir; do
+  { if [ "$mode" = all ]; then list_dirs; else list_repos; fi; } | while IFS= read -r dir; do
     if [ -n "$roots" ] && grep -qxF "$dir" <<<"$roots"; then
       continue
     fi
@@ -43,7 +49,7 @@ create_session() {
 
 case "${1:-}" in
   --list)
-    picker_input
+    if [ "${2:-}" = "--all" ]; then picker_input all; else picker_input; fi
     exit 0
     ;;
   --new)
@@ -62,7 +68,11 @@ case "${1:-}" in
     ;;
 esac
 
-selected="$(picker_input | fzf --reverse --prompt='session/repo > ')" || exit 0
+selected="$(picker_input | fzf --reverse --prompt='repos > ' \
+  --header='alt-h: toggle all dirs' \
+  --bind "alt-h:transform:[[ \$FZF_PROMPT == 'repos > ' ]] \
+    && echo 'change-prompt(dirs > )+reload($0 --list --all)' \
+    || echo 'change-prompt(repos > )+reload($0 --list)'")" || exit 0
 
 if [[ "$selected" == "● "* ]]; then
   tmux switch-client -t "=${selected#● }"
