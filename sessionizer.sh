@@ -6,16 +6,18 @@ SEARCH_ROOT="$HOME/Dev"
 MAX_DEPTH=3
 WINDOWS=(Claude IDE Termione Termitwo)
 
-sanitize() { printf '%s' "$1" | tr '.:' '__'; }
+# tmux forbids . and : in session names. Sets $REPLY rather than printing, so
+# callers don't need a forking $(...).
+sanitize() { REPLY="${1//[.:]/_}"; }
 
 list_repos() {
-  fd -HI --max-depth "$MAX_DEPTH" '^\.git$' "$SEARCH_ROOT" 2>/dev/null |
-    sed 's:/\.git/*$::' | sort -u
+  # --prune: don't descend into the .git dirs themselves
+  fd -HI --max-depth "$MAX_DEPTH" --prune --format '{//}' '^\.git$' "$SEARCH_ROOT" 2>/dev/null |
+    sort -u
 }
 
 list_dirs() {
-  fd --type d --max-depth 2 . "$SEARCH_ROOT" 2>/dev/null |
-    sed 's:/*$::' | sort -u
+  fd --type d --max-depth 2 --format '{}' . "$SEARCH_ROOT" 2>/dev/null | sort -u
 }
 
 # One tmux call and one awk pass, instead of a process per line: forks are
@@ -37,17 +39,21 @@ picker_input() {
     ' <(if [ "$mode" = all ]; then list_dirs; else list_repos; fi)
 }
 
+# Creates the session, and switches to it when run inside tmux, in one tmux
+# call. A duplicate name makes new-session fail, which aborts the rest of the
+# chain, so there's no separate has-session check.
 create_session() {
   local dir="$1" name="$2" w
-  if tmux has-session -t="$name" 2>/dev/null; then
-    return 1
-  fi
   local cmd=(new-session -ds "$name" -c "$dir" -n "${WINDOWS[0]}"
-    \; set-option -t "$name" @sessionizer_root "$dir")
+    \; set-option -t "=$name:" @sessionizer_root "$dir")
   for w in "${WINDOWS[@]:1}"; do
-    cmd+=(\; new-window -t "$name:" -c "$dir" -n "$w")
+    cmd+=(\; new-window -t "=$name:" -c "$dir" -n "$w")
   done
-  tmux "${cmd[@]}" \; select-window -t "$name:${WINDOWS[0]}"
+  cmd+=(\; select-window -t "=$name:${WINDOWS[0]}")
+  if [ -n "${TMUX:-}" ]; then
+    cmd+=(\; switch-client -t "=$name")
+  fi
+  tmux "${cmd[@]}"
 }
 
 case "${1:-}" in
@@ -59,23 +65,20 @@ case "${1:-}" in
     dir="${2:?usage: sessionizer.sh --new <dir> [name]}"
     dir="${dir%/}"
     [ -d "$dir" ] || { echo "no such directory: $dir" >&2; exit 1; }
-    name="$(sanitize "${3:-$(basename "$dir")}")"
-    if ! create_session "$dir" "$name"; then
-      echo "session \"$name\" already exists" >&2
-      exit 1
-    fi
-    if [ -n "${TMUX:-}" ]; then
-      tmux switch-client -t "=$name"
-    fi
-    exit 0
+    sanitize "${3:-${dir##*/}}"
+    create_session "$dir" "$REPLY"
+    exit
     ;;
 esac
 
 # pipefail off here: if Enter lands before the list finishes, the lister dies
 # of SIGPIPE, and that must not discard the selection — only fzf's status counts.
+# enter waits for the search to catch up with the query (under load it lags
+# the keystrokes and would accept a stale item) and ignores a no-match Enter.
 set +o pipefail
 selected="$(picker_input | fzf --reverse --prompt='repos > ' \
   --header='alt-h: toggle all dirs' \
+  --bind 'enter:wait+accept-non-empty' \
   --bind "alt-h:transform:[[ \$FZF_PROMPT == 'repos > ' ]] \
     && echo 'change-prompt(dirs > )+reload($0 --list --all)' \
     || echo 'change-prompt(repos > )+reload($0 --list)'")" || exit 0
@@ -85,15 +88,13 @@ if [[ "$selected" == "● "* ]]; then
   exit 0
 fi
 
-default="$(sanitize "$(basename "$selected")")"
+sanitize "${selected##*/}"
+default="$REPLY"
 while :; do
   printf 'session name [%s]: ' "$default"
   IFS= read -r input </dev/tty
-  name="$(sanitize "${input:-$default}")"
-  [ -z "$name" ] && continue
-  if create_session "$selected" "$name"; then
-    break
-  fi
-  printf 'session "%s" already exists — choose another name\n' "$name"
+  sanitize "${input:-$default}"
+  [ -z "$REPLY" ] && continue
+  create_session "$selected" "$REPLY" && break
+  echo 'choose another name'
 done
-tmux switch-client -t "=$name"
