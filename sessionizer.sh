@@ -10,7 +10,7 @@ sanitize() { printf '%s' "$1" | tr '.:' '__'; }
 
 list_repos() {
   fd -HI --max-depth "$MAX_DEPTH" '^\.git$' "$SEARCH_ROOT" 2>/dev/null |
-    xargs -n1 dirname | sort -u
+    sed 's:/\.git/*$::' | sort -u
 }
 
 list_dirs() {
@@ -18,20 +18,23 @@ list_dirs() {
     sed 's:/*$::' | sort -u
 }
 
-session_names() { tmux list-sessions -F '#{session_name}' 2>/dev/null || true; }
-session_roots() { tmux list-sessions -F '#{@sessionizer_root}' 2>/dev/null | sed '/^$/d' || true; }
-
+# One tmux call and one awk pass, instead of a process per line: forks are
+# what gets slow when the machine is busy.
 picker_input() {
   local mode="${1:-repos}"
-  session_names | sed 's/^/● /'
-  local roots dir
-  roots="$(session_roots)"
-  { if [ "$mode" = all ]; then list_dirs; else list_repos; fi; } | while IFS= read -r dir; do
-    if [ -n "$roots" ] && grep -qxF "$dir" <<<"$roots"; then
-      continue
-    fi
-    printf '%s\n' "$dir"
-  done
+  SESSIONS="$(tmux list-sessions -F '#{session_name}	#{@sessionizer_root}' 2>/dev/null || true)" \
+    awk '
+      BEGIN {
+        n = split(ENVIRON["SESSIONS"], lines, "\n")
+        for (i = 1; i <= n; i++) {
+          split(lines[i], f, "\t")
+          if (f[1] != "") print "● " f[1]
+          if (f[2] != "") open[f[2]] = 1
+        }
+        fflush()
+      }
+      !($0 in open)
+    ' <(if [ "$mode" = all ]; then list_dirs; else list_repos; fi)
 }
 
 create_session() {
@@ -39,12 +42,12 @@ create_session() {
   if tmux has-session -t="$name" 2>/dev/null; then
     return 1
   fi
-  tmux new-session -ds "$name" -c "$dir" -n "${WINDOWS[0]}"
-  tmux set-option -t "$name" @sessionizer_root "$dir"
+  local cmd=(new-session -ds "$name" -c "$dir" -n "${WINDOWS[0]}"
+    \; set-option -t "$name" @sessionizer_root "$dir")
   for w in "${WINDOWS[@]:1}"; do
-    tmux new-window -t "$name:" -c "$dir" -n "$w"
+    cmd+=(\; new-window -t "$name:" -c "$dir" -n "$w")
   done
-  tmux select-window -t "$name:${WINDOWS[0]}"
+  tmux "${cmd[@]}" \; select-window -t "$name:${WINDOWS[0]}"
 }
 
 case "${1:-}" in
@@ -68,6 +71,9 @@ case "${1:-}" in
     ;;
 esac
 
+# pipefail off here: if Enter lands before the list finishes, the lister dies
+# of SIGPIPE, and that must not discard the selection — only fzf's status counts.
+set +o pipefail
 selected="$(picker_input | fzf --reverse --prompt='repos > ' \
   --header='alt-h: toggle all dirs' \
   --bind "alt-h:transform:[[ \$FZF_PROMPT == 'repos > ' ]] \
